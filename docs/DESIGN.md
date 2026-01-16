@@ -1796,11 +1796,13 @@ private:
 
 ### JavaScript/TypeScript Thread Safety
 
-Node.js is single-threaded for JavaScript execution, but file operations are async.
-We use a write queue to ensure ordered writes.
+Node.js is single-threaded for JavaScript execution. The RotatingFileHandler uses
+synchronous file operations to ensure data integrity during rotation, while the
+regular FileHandler uses async streams with batching for higher throughput.
 
 ```typescript
 // src/handlers/rotating.ts
+// Uses synchronous file operations for guaranteed data integrity during rotation
 
 import * as fs from 'fs';
 import * as path from 'path';
@@ -1809,121 +1811,115 @@ export class RotatingFileHandler implements Handler {
   private readonly filePath: string;
   private readonly maxSizeBytes: number;
   private readonly maxBackupCount: number;
-  
-  private fileHandle: fs.promises.FileHandle | null = null;
+  private readonly formatter: JSONFormatter;
+
+  private fd: number | null = null;       // File descriptor for sync I/O
   private currentSize: number = 0;
-  private writeQueue: Promise<void> = Promise.resolve();
-  
-  constructor(
-    filePath: string,
-    maxSizeBytes: number,
-    maxBackupCount: number
-  ) {
+  private closed: boolean = false;
+
+  constructor(filePath: string, maxSizeMB: number, maxBackupCount: number) {
     this.filePath = filePath;
-    this.maxSizeBytes = maxSizeBytes;
+    this.maxSizeBytes = maxSizeMB * 1024 * 1024;
     this.maxBackupCount = maxBackupCount;
+    this.formatter = new JSONFormatter();
+    this.ensureDirectory();
+    this.openFile();
+    this.syncCurrentSize();
   }
-  
-  async initialize(): Promise<void> {
-    await this.openFile();
-  }
-  
-  emit(entry: LogEntry): void {
-    const formatted = JSON.stringify(entry) + '\n';
-    
-    // Queue write to ensure order
-    this.writeQueue = this.writeQueue.then(async () => {
-      const entrySize = Buffer.byteLength(formatted, 'utf8');
-      
-      // Check if rotation needed
-      if (this.currentSize + entrySize > this.maxSizeBytes) {
-        await this.rotate();
-      }
-      
-      // Write entry
-      if (this.fileHandle) {
-        await this.fileHandle.write(formatted);
-        this.currentSize += entrySize;
-      }
-    }).catch(err => {
-      console.error('Log write failed:', err);
-    });
-  }
-  
-  private async rotate(): Promise<void> {
-    // Close current file
-    if (this.fileHandle) {
-      await this.fileHandle.close();
-      this.fileHandle = null;
-    }
-    
-    // Delete oldest backup
-    const oldest = this.backupPath(this.maxBackupCount);
-    try {
-      await fs.promises.unlink(oldest);
-    } catch {
-      // File may not exist
-    }
-    
-    // Rotate existing files
-    for (let i = this.maxBackupCount - 1; i >= 1; i--) {
-      const src = i === 1 ? this.filePath : this.backupPath(i);
-      const dst = this.backupPath(i + 1);
-      
-      try {
-        await fs.promises.rename(src, dst);
-      } catch {
-        // Source may not exist
-      }
-    }
-    
-    // Rename current to .1
-    try {
-      await fs.promises.rename(this.filePath, this.backupPath(1));
-    } catch {
-      // Current may not exist
-    }
-    
-    // Open new file
-    await this.openFile();
-  }
-  
-  private async openFile(): Promise<void> {
-    // Create directory if needed
+
+  private ensureDirectory(): void {
     const dir = path.dirname(this.filePath);
-    await fs.promises.mkdir(dir, { recursive: true });
-    
-    // Get existing size
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+  }
+
+  private openFile(): void {
+    // Open in append mode with synchronous writes
+    this.fd = fs.openSync(this.filePath, 'a');
+  }
+
+  private closeFile(): void {
+    if (this.fd !== null) {
+      fs.fsyncSync(this.fd);  // Ensure all data on disk
+      fs.closeSync(this.fd);
+      this.fd = null;
+    }
+  }
+
+  private syncCurrentSize(): void {
     try {
-      const stats = await fs.promises.stat(this.filePath);
+      const stats = fs.statSync(this.filePath);
       this.currentSize = stats.size;
     } catch {
       this.currentSize = 0;
     }
-    
-    this.fileHandle = await fs.promises.open(this.filePath, 'a');
   }
-  
-  private backupPath(index: number): string {
-    return `${this.filePath}.${index}`;
+
+  emit(entry: LogEntry): void {
+    if (this.closed || this.fd === null) return;
+
+    const formatted = this.formatter.format(entry);
+    const output = formatted + '\n';
+    const entryBytes = Buffer.byteLength(output, 'utf8');
+
+    // Check if rotation needed BEFORE writing
+    if (this.currentSize + entryBytes > this.maxSizeBytes) {
+      this.rotate();
+    }
+
+    // Synchronous write - guarantees data integrity
+    fs.writeSync(this.fd!, output, null, 'utf8');
+    this.currentSize += entryBytes;
   }
-  
+
+  private rotate(): void {
+    // Close current file (fsync ensures data on disk)
+    this.closeFile();
+
+    // Delete oldest backup
+    const oldest = `${this.filePath}.${this.maxBackupCount}`;
+    if (fs.existsSync(oldest)) {
+      fs.unlinkSync(oldest);
+    }
+
+    // Rotate existing files (reverse order to avoid overwrites)
+    for (let i = this.maxBackupCount - 1; i >= 1; i--) {
+      const src = `${this.filePath}.${i}`;
+      const dst = `${this.filePath}.${i + 1}`;
+      if (fs.existsSync(src)) {
+        fs.renameSync(src, dst);
+      }
+    }
+
+    // Rename current to .1
+    if (fs.existsSync(this.filePath)) {
+      fs.renameSync(this.filePath, `${this.filePath}.1`);
+    }
+
+    // Open new file
+    this.openFile();
+    this.currentSize = 0;
+  }
+
   async flush(): Promise<void> {
-    await this.writeQueue;
-    if (this.fileHandle) {
-      await this.fileHandle.sync();
+    if (this.fd !== null) {
+      fs.fsyncSync(this.fd);
     }
   }
-  
+
   async close(): Promise<void> {
-    await this.flush();
-    if (this.fileHandle) {
-      await this.fileHandle.close();
-      this.fileHandle = null;
-    }
+    this.closed = true;
+    this.closeFile();
   }
 }
 ```
+
+> **Implementation Note:** The JavaScript RotatingFileHandler uses synchronous file operations
+> (`fs.openSync`, `fs.writeSync`, `fs.fsyncSync`) instead of async streams. This guarantees
+> no data loss during rotation by ensuring all data is written to disk before any file
+> operations occur. While this has slightly higher latency per write (~1-5ms), it provides
+> stronger data integrity guarantees required for reliable log rotation.
 
 ---
 
