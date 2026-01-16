@@ -1,0 +1,12 @@
+[requires]
+nlohmann_json/3.11.3
+spdlog/1.12.0
+catch2/3.4.0
+
+[generators]
+cmake
+CMakeDeps
+CMakeToolchain
+
+[options]
+spdlog/*:header_only=True
